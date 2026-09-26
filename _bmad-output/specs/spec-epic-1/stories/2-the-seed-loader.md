@@ -57,6 +57,34 @@ context: ['{project-root}/_bmad-output/specs/spec-epic-1/SPEC.md', '{project-roo
 - Given a clean checkout, when `uv run python load_seed.py` runs, then `app.db` exists at the repo root with `tickets` (24 rows) and `customers` (20 rows), and the command prints both counts.
 - Given the repo after this story, when `uv run pytest` runs, then all tests pass, including story 1's, with no network connection or API key.
 
+### Review Findings
+
+Code review 2026-09-26 (branch `story/jai-1.2` vs `main`; layers: blind, edge, verif, acceptance).
+
+- [x] [Review][Patch] No test fails the second table, so the one-transaction rollback of `tickets` is unproven — moving `conn.commit()` into the loop keeps every test green (medium; verif+blind) [tests/test_load_seed.py:140]
+- [x] [Review][Patch] The no-argument CLI (`DEFAULT_SEED_DIR`, printed counts) is never exercised; triage rows #2/#8 overstate the earlier patch (low; verif+blind+acceptance) [load_seed.py:89]
+- [x] [Review][Patch] Duplicate-id tests `match="tickets"` also match sqlite's own message, so the `Loading table ...` wrapper is unverified (low; blind+acceptance) [tests/test_load_seed.py:146]
+- [x] [Review][Patch] `test_invalid_seed_changes_nothing` accepts any `ValueError`; add a per-case `match` (low; blind) [tests/test_load_seed.py:174]
+
+**Rejected**
+
+- Design Notes say `with sqlite3.connect(...)`, code uses `autocommit=False` (blind, verif, edge, acceptance) — fix edits the spec; route through `/bmad-spec`.
+- Frontmatter `status: done` / `review_loop_iteration: 0`; empty Spec Change Log (blind, acceptance) — fix edits the spec.
+- Header / integer validation and fresh-DB cleanup are "beyond the spec" (acceptance) — false: both follow from the Always clause (exact headers; failed run leaves `app.db` untouched).
+- Missing `tickets.csv` untested (blind) — false: same `_read_csv` branch as the tested `customers.csv` case.
+- `rollback()`/`close()` raising masks the original error (blind, edge) — low: needs a failing rollback on a local DB; fix restructures cleanup.
+- CLI prints `app.db`, not the full path (blind) — false: no harm named; the path is the fixed default.
+- Other tables surviving a failed load untested (blind) — low: no statement touches other tables.
+- "41 passed" not re-verified (blind) — false: re-run in review, 41 passed.
+- Short/long CSV rows load NULLs or truncate (edge) — low: `seed/` is read-only and well-formed; fix adds guards.
+- `int()` accepts `4_0`, `+4`, `-1` (edge) — low: seed values are 0–4; fix adds a guard.
+- Blank or padded primary keys (edge) — low: seed has none; fix adds a guard.
+- Header-only CSV empties both tables (edge) — false: contents then equal the CSVs, as specified.
+- `connect()` outside `try` (edge) — false: it fails loudly before any file is written, so no cleanup is needed.
+- `exists()`/unlink race with another process (edge) — low: needs a concurrent `app.db` creator; fix adds complexity.
+- User indexes/triggers dropped on rerun (edge) — false: the spec mandates drop-and-recreate.
+- UTF-8 BOM breaks the header check (edge) — low: seed has no BOM and is read-only.
+
 ## Implementation Notes
 
 - Implemented by a subagent. Files: `load_seed.py`, `tests/test_load_seed.py`.

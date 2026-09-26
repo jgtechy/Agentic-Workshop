@@ -4,6 +4,8 @@ import csv
 import importlib.util
 import shutil
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -143,7 +145,7 @@ def test_duplicate_id_changes_nothing(db, seed_copy):
     tickets = seed_copy / "tickets.csv"
     with tickets.open("a", newline="", encoding="utf-8") as handle:
         csv.writer(handle).writerow(["T-1042", "C-05", "2026-09-30T00:00:00", "duplicate"])
-    with pytest.raises(sqlite3.IntegrityError, match="tickets"):
+    with pytest.raises(sqlite3.IntegrityError, match="Loading table 'tickets'"):
         load_seed.load_seed(db_path=db, seed_dir=seed_copy)
     assert snapshot(db) == before
 
@@ -151,26 +153,51 @@ def test_duplicate_id_changes_nothing(db, seed_copy):
 def test_duplicate_id_on_fresh_db_leaves_no_file(db, seed_copy):
     with (seed_copy / "tickets.csv").open("a", newline="", encoding="utf-8") as handle:
         csv.writer(handle).writerow(["T-1042", "C-05", "2026-09-30T00:00:00", "duplicate"])
-    with pytest.raises(sqlite3.IntegrityError, match="tickets"):
+    with pytest.raises(sqlite3.IntegrityError, match="Loading table 'tickets'"):
         load_seed.load_seed(db_path=db, seed_dir=seed_copy)
     assert not db.exists()
 
 
+
+def test_second_table_failure_rolls_back_first(db, seed_copy):
+    # tickets is rebuilt first, so a customers failure proves both tables share one transaction.
+    load_seed.load_seed(db_path=db, seed_dir=SEED_DIR)
+    before = snapshot(db)
+    tickets = seed_copy / "tickets.csv"
+    tickets.write_text(tickets.read_text(encoding="utf-8").replace("Nothing is saving.", "changed", 1), encoding="utf-8")
+    with (seed_copy / "customers.csv").open("a", newline="", encoding="utf-8") as handle:
+        csv.writer(handle).writerow(["C-05", "Duplicate", "Free", "0"])
+    with pytest.raises(sqlite3.IntegrityError, match="Loading table 'customers'"):
+        load_seed.load_seed(db_path=db, seed_dir=seed_copy)
+    assert snapshot(db) == before
+
+
+def test_cli_loads_default_paths_and_prints_counts(tmp_path):
+    # Run a copy of the script so its repo-root defaults point at tmp_path, not the real app.db.
+    shutil.copy(REPO_ROOT / "load_seed.py", tmp_path / "load_seed.py")
+    shutil.copytree(SEED_DIR, tmp_path / "seed")
+    result = subprocess.run(
+        [sys.executable, str(tmp_path / "load_seed.py")], capture_output=True, text=True, check=True
+    )
+    assert "24 tickets" in result.stdout and "20 customers" in result.stdout
+    assert rows(tmp_path / "app.db", "SELECT count(*) FROM tickets") == [(24,)]
+    assert rows(tmp_path / "app.db", "SELECT count(*) FROM customers") == [(20,)]
+
 @pytest.mark.parametrize(
-    ("filename", "old", "new"),
+    ("filename", "old", "new", "message"),
     [
-        ("tickets.csv", "ticket_id,customer_id,created_at,text", "id,customer_id,created_at,text"),
-        ("customers.csv", "C-05,Hooli,Enterprise,4", "C-05,Hooli,Enterprise,many"),
+        ("tickets.csv", "ticket_id,customer_id,created_at,text", "id,customer_id,created_at,text", "expected header"),
+        ("customers.csv", "C-05,Hooli,Enterprise,4", "C-05,Hooli,Enterprise,many", "open_tickets must be an integer"),
     ],
     ids=["bad-header", "non-integer-open-tickets"],
 )
-def test_invalid_seed_changes_nothing(db, seed_copy, filename, old, new):
+def test_invalid_seed_changes_nothing(db, seed_copy, filename, old, new, message):
     load_seed.load_seed(db_path=db, seed_dir=SEED_DIR)
     before = db.read_bytes()
     path = seed_copy / filename
     content = path.read_text(encoding="utf-8")
     assert old in content
     path.write_text(content.replace(old, new, 1), encoding="utf-8")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=message):
         load_seed.load_seed(db_path=db, seed_dir=seed_copy)
     assert db.read_bytes() == before
