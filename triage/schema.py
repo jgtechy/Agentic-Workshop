@@ -10,8 +10,9 @@ Category = Literal["billing", "bug", "access", "performance", "how-to"]
 Priority = Literal["P1", "P2", "P3", "P4"]
 Route = Literal["billing-team", "bug-team", "access-team", "performance-team", "how-to-team"]
 
-# A sentence end (. ! ?) followed by whitespace and more text means a second sentence.
-_SENTENCE_BREAK = re.compile(r"[.!?]\s+\S")
+# A sentence end (. ! ?), optionally closed by a quote or bracket, then whitespace and
+# more text means a second sentence.
+_SENTENCE_BREAK = re.compile(r"[.!?][\"')\]]*\s+\S")
 
 
 class TriageDecision(BaseModel):
@@ -21,7 +22,7 @@ class TriageDecision(BaseModel):
 
     category: Category = Field(description="The ticket's category from the triage policy.")
     priority: Priority = Field(description="P1 is the most urgent, P4 the least.")
-    route: Route = Field(description="The team that handles this category.")
+    route: Route = Field(description="The team the ticket is routed to.")
     rationale: str = Field(description="One sentence naming the policy rule that was applied.")
 
     @field_validator("rationale")
@@ -29,9 +30,9 @@ class TriageDecision(BaseModel):
     def _one_sentence(cls, value: str) -> str:
         text = value.strip()
         if not text:
-            raise ValueError("rationale must not be empty")
+            raise ValueError("must not be empty")
         if _SENTENCE_BREAK.search(text):
-            raise ValueError("rationale must be a single sentence")
+            raise ValueError("must be a single sentence")
         return text
 
 

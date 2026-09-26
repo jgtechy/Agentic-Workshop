@@ -62,8 +62,18 @@ def test_route_and_category_are_independent():
     assert (decision.category, decision.route) == ("billing", "bug-team")
 
 
-def test_multi_sentence_rationale():
-    assert "rationale" in rejected({**VALID, "rationale": "Money is at stake. Customer is angry."})
+@pytest.mark.parametrize(
+    "rationale",
+    [
+        "Money is at stake. Customer is angry.",
+        "Money is at stake! Customer is angry.",
+        "Is money at stake? Customer is angry.",
+        'Customer says "charged twice." Customer is angry.',
+        "Money is at stake (double charge.) Customer is angry.",
+    ],
+)
+def test_multi_sentence_rationale(rationale):
+    assert "rationale" in rejected({**VALID, "rationale": rationale})
 
 
 @pytest.mark.parametrize(
@@ -87,7 +97,11 @@ def test_rationale_is_trimmed():
 
 
 def test_error_message_format():
-    assert rejected({**VALID, "rationale": "A. B."}) == "Invalid triage decision: rationale: rationale must be a single sentence"
+    assert rejected({**VALID, "rationale": "A. B."}) == "Invalid triage decision: rationale: must be a single sentence"
+
+
+def test_validation_error_is_a_value_error():
+    assert issubclass(TriageValidationError, ValueError)
 
 
 def test_decision_is_immutable():
@@ -102,3 +116,9 @@ def test_json_schema_lists_allowed_values_and_descriptions():
     assert properties["priority"]["enum"] == ["P1", "P2", "P3", "P4"]
     assert properties["route"]["enum"] == ["billing-team", "bug-team", "access-team", "performance-team", "how-to-team"]
     assert all(field.get("description") for field in properties.values())
+
+
+def test_json_schema_forbids_extra_fields_and_requires_all():
+    schema = TriageDecision.model_json_schema()
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["category", "priority", "route", "rationale"]

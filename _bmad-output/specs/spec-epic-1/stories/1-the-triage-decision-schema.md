@@ -64,6 +64,30 @@ context: ['{project-root}/_bmad-output/specs/spec-epic-1/SPEC.md', '{project-roo
 - Given the repo after this story, when `uv run pytest` runs, then all schema tests pass and nothing needs a network connection or API key.
 - Given `TriageDecision`, when `TriageDecision.model_json_schema()` is called, then category, priority and route appear as enums with the exact allowed values, and every field has a description.
 
+### Review Findings
+
+Code review of `main...story/jai-1.1` (2026-09-26): 1 decision-needed (resolved → patch), 6 patch, 0 defer, 11 rejected.
+
+- [x] [Review][Patch] Sentence end followed by a closing quote or bracket escapes the one-sentence rule (decision resolved: widen the regex) [triage/schema.py:14] — `'Money at stake." Customer angry.'` validates (reproduced). The frozen rule literally needs `.`/`!`/`?` followed directly by whitespace, so this matches the letter of the decision but not its intent. A model quoting ticket text could hit it. Options: widen the regex to `[.!?]["')\]]*\s+\S` plus a test, or keep the literal rule.
+- [x] [Review][Patch] Single-sentence rule untested for `!` and `?` breaks; narrowing the regex to `\.` keeps all tests green [tests/test_schema.py:65]
+- [x] [Review][Patch] `route` description "The team that handles this category." hints at a pairing the schema deliberately does not enforce [triage/schema.py:25]
+- [x] [Review][Patch] Error message repeats the field name (`rationale: rationale must be a single sentence`); drop the field from the validator messages and update the format test [triage/schema.py:32]
+- [x] [Review][Patch] No test that `TriageValidationError` subclasses `ValueError`, a stated public-interface constraint [tests/test_schema.py:8]
+- [x] [Review][Patch] JSON-schema test does not assert `additionalProperties: false` or the four required fields, the hints Epic 2 sends to the model [tests/test_schema.py:99]
+
+**Rejected:**
+- `frozen=True` goes beyond the spec — false: no consumer on `stage-3`/`stage-4` mutates a decision (`ToolStrategy(TriageDecision)`, `model_validate` only).
+- SPEC.md still lists the two settled questions as open — fix edits a spec; raise via `/bmad-spec`.
+- Spec Change Log empty / `review_loop_iteration: 0` — fix edits the spec.
+- `'decision'` fallback for empty `loc` never exercised — no bad outcome; non-dicts are rejected before Pydantic runs.
+- Export value sets as plain constants — adds public surface; no current caller needs it.
+- `conftest.py` edits `sys.path` instead of pytest `pythonpath` — the story marks `pyproject.toml` read-only.
+- Ellipsis rejected / bare newline not treated as a break — false: matches the frozen definition (prior triage #1, #2).
+- No network/API-key guard in tests — low: schema code is pure; fixture adds complexity.
+- Zero-width-only rationale passes — low: unlikely from a model; fix adds a guard.
+- Oversized-int test fails under `PYTHONINTMAXSTRDIGITS=0` — low: unusual environment (reproduced); fix adds complexity.
+- `validate_decision` annotation narrower than tested inputs — low: annotation states the contract; off-type tests prove robust rejection.
+
 ## Implementation Notes
 
 - Implemented inline (no subagent). Files: `triage/__init__.py` (empty), `triage/schema.py`, `tests/conftest.py`, `tests/test_schema.py`.
