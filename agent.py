@@ -1,23 +1,30 @@
-"""The triage agent (Epic 2, story 2.1).
+"""The triage agent (Epic 2, stories 2.1 and 2.2).
 
 A LangChain `create_agent` whose instructions are TRIAGE_POLICY.md, whose tools come
 from mcp/triage_server.py over stdio, and whose structured output is the Epic 1
-`TriageDecision`. `triage(ticket_id)` returns the decision as a plain dict.
+`TriageDecision`. A local `escalate_to_human` tool is gated by LangChain's
+human-in-the-loop middleware: every call pauses the run until an approver says yes or no.
+`triage(ticket_id)` returns the decision as a plain dict.
 """
 
+import inspect
 import json
 import os
 import sys
-from collections.abc import Sequence
+import uuid
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from langchain.agents import create_agent
-from langchain.agents.middleware import wrap_tool_call
+from langchain.agents.middleware import HumanInTheLoopMiddleware, wrap_tool_call
 from langchain.agents.structured_output import StructuredOutputError, ToolStrategy
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import ToolMessage
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, tool
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 from triage.schema import TriageDecision, TriageValidationError, validate_decision
 
@@ -32,6 +39,8 @@ PROVIDERS: dict[str, tuple[str, str]] = {
 }
 
 MAX_ATTEMPTS = 2  # the first attempt plus one retry
+ESCALATION_TOOL = "escalate_to_human"
+ENTERPRISE = "Enterprise"
 
 SYSTEM_PROMPT_TAIL = """
 
@@ -137,6 +146,8 @@ def is_grounded(messages: Sequence[Any], ticket_id: str) -> bool:
 
 def check_tool_order(tool_call: dict, messages: Sequence[Any]) -> str | None:
     """Why this tool call must be refused, or None when it may run."""
+    if tool_call.get("name") == ESCALATION_TOOL:
+        return check_escalation(tool_call, messages)
     if tool_call.get("name") != "get_customer_history":
         return None
     allowed = ticket_customer_ids(messages)
@@ -148,6 +159,46 @@ def check_tool_order(tool_call: dict, messages: Sequence[Any]) -> str | None:
         return (
             f"Refused: get_customer_history must use the customer_id that get_ticket returned "
             f"({', '.join(sorted(allowed))}), not {customer_id!r}."
+        )
+    return None
+
+
+def _successful_results(messages: Sequence[Any], name: str) -> list[dict]:
+    results = []
+    for message in messages:
+        if isinstance(message, ToolMessage) and message.name == name and message.status != "error":
+            result = _tool_result(message)
+            if result:
+                results.append(result)
+    return results
+
+
+def customer_plan(messages: Sequence[Any], ticket_id: str) -> str | None:
+    """The plan of ticket_id's customer, from successful get_ticket and get_customer_history results."""
+    customer_ids = ticket_customer_ids(messages, ticket_id)
+    for result in _successful_results(messages, "get_customer_history"):
+        if result.get("customer_id") in customer_ids:
+            plan = result.get("plan")
+            return plan if isinstance(plan, str) else None
+    return None
+
+
+def check_escalation(tool_call: dict, messages: Sequence[Any]) -> str | None:
+    """Why this escalate_to_human call must be refused, or None when it may go to the approver."""
+    args = tool_call.get("args")
+    ticket_id = args.get("ticket_id") if isinstance(args, dict) else None
+    if not isinstance(ticket_id, str) or not ticket_customer_ids(messages, ticket_id):
+        return (
+            f"Refused: escalate_to_human needs the ticket_id of a ticket you looked up with get_ticket, "
+            f"not {ticket_id!r}."
+        )
+    plan = customer_plan(messages, ticket_id)
+    if plan is None:
+        return "Refused: call get_customer_history for this ticket's customer before escalating."
+    if plan != ENTERPRISE:
+        return (
+            f"Refused: only tickets from Enterprise customers are escalated; this customer is on {plan!r}. "
+            "Do not call escalate_to_human again; return your decision."
         )
     return None
 
@@ -170,7 +221,8 @@ def _state_messages(request) -> Sequence[Any]:
 
 @wrap_tool_call
 async def tool_order_guard(request, handler):
-    """Allow get_customer_history only after get_ticket, with the customer_id it returned."""
+    """Allow get_customer_history only after get_ticket, with the customer_id it returned,
+    and escalate_to_human only for a looked-up ticket whose customer is on Enterprise."""
     reason = check_tool_order(request.tool_call, _state_messages(request))
     if reason:
         return _refusal(request, reason)
@@ -192,27 +244,194 @@ def build_agent(
     tools: Sequence[BaseTool],
     extra_tools: Sequence[BaseTool] = (),
     middleware: Sequence[Any] = (),
+    checkpointer: Any = None,
 ):
-    """The triage agent. Story 2.2 passes escalate_to_human and its middleware here."""
+    """The triage agent. `build_escalating_agent` passes escalate_to_human and its middleware here."""
     all_tools = [*tools, *extra_tools]
-    escalation_available = any(getattr(t, "name", None) == "escalate_to_human" for t in all_tools)
+    escalation_available = any(getattr(t, "name", None) == ESCALATION_TOOL for t in all_tools)
     return create_agent(
         model,
         tools=all_tools,
         system_prompt=system_prompt(escalation_available),
         middleware=[tool_order_guard, *middleware],
         response_format=ToolStrategy(TriageDecision, handle_errors=False),
+        checkpointer=checkpointer,
     )
 
 
-async def run_with_retry(agent, ticket_id: str) -> dict:
-    """Invoke the agent; on a schema or grounding failure, invoke it once more."""
+# --- Human-gated escalation (story 2.2) -------------------------------------------------------
+
+DECLINED_MESSAGE = (
+    "The approver declined this escalation, so the ticket was not escalated. "
+    "Do not call escalate_to_human again; return your decision."
+)
+
+
+@tool(ESCALATION_TOOL)
+def escalate_to_human(ticket_id: str, reason: str) -> str:
+    """Escalate a ticket to a person. Call it only when the final priority is P1 and the customer
+    is on the Enterprise plan, before returning your decision. A person must approve every call."""
+    return f"Escalated {ticket_id} to a person. Reason: {reason}"
+
+
+@dataclass(frozen=True)
+class EscalationRequest:
+    """A pending escalate_to_human call waiting for an approver's yes or no."""
+
+    ticket_id: str
+    reason: str
+
+
+Approver = Callable[[EscalationRequest], bool | Awaitable[bool]]
+
+
+def _printable(text: str) -> str:
+    """One line with control characters removed: the reason comes from the model, not from us."""
+    return " ".join("".join(ch if ch.isprintable() else " " for ch in text).split())
+
+
+def _stdin_is_terminal() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def terminal_approver(request: EscalationRequest) -> bool:
+    """Ask on the terminal. y/yes approves, n/no declines, end of input declines, anything else asks again.
+    A non-interactive stdin (piped or redirected) declines without being read: no person is there.
+
+    The prompt and the outcome go to stderr so stdout carries only the JSON decision."""
+    print(
+        f"\nEscalate {_printable(request.ticket_id)} to a person? "
+        f"Agent's reason (model-written, may echo ticket text): {_printable(request.reason)}",
+        file=sys.stderr,
+        flush=True,
+    )
+    if not _stdin_is_terminal():
+        print("stdin is not a terminal, so no person can approve: declining.", file=sys.stderr)
+        print("Not escalated.", file=sys.stderr, flush=True)
+        return False
+    while True:
+        print("Approve escalation? [y/n] ", end="", file=sys.stderr, flush=True)
+        try:
+            answer = input().strip().lower()
+        except EOFError:  # Ctrl-D on a terminal
+            print(file=sys.stderr)
+            approved = False
+            break
+        if answer in ("y", "yes"):
+            approved = True
+            break
+        if answer in ("n", "no"):
+            approved = False
+            break
+    print(f"Escalated {_printable(request.ticket_id)} to a person." if approved else "Not escalated.", file=sys.stderr, flush=True)
+    return approved
+
+
+def _escalation_needs_approval(request) -> bool:
+    """HITL `when` predicate: a call the guard will refuse is not shown to the approver.
+
+    It then goes straight to tool_order_guard, which refuses it with the same check, so a
+    call either pauses for approval or is refused; it never runs unapproved."""
+    return check_escalation(request.tool_call, _state_messages(request)) is None
+
+
+def escalation_middleware() -> HumanInTheLoopMiddleware:
+    return HumanInTheLoopMiddleware(
+        interrupt_on={
+            ESCALATION_TOOL: {
+                "allowed_decisions": ["approve", "reject"],
+                "when": _escalation_needs_approval,
+            }
+        },
+        description_prefix="Escalation to a person requires approval",
+    )
+
+
+def build_escalating_agent(model: BaseChatModel, tools: Sequence[BaseTool]):
+    """The triage agent with escalate_to_human, its HITL gate and the checkpointer the gate needs."""
+    return build_agent(
+        model,
+        tools,
+        extra_tools=[escalate_to_human],
+        middleware=[escalation_middleware()],
+        checkpointer=InMemorySaver(),
+    )
+
+
+def _to_request(action: dict) -> EscalationRequest:
+    args = action.get("args") if isinstance(action, dict) else None
+    args = args if isinstance(args, dict) else {}
+    return EscalationRequest(ticket_id=str(args.get("ticket_id", "")), reason=str(args.get("reason", "")))
+
+
+async def _ask(approve: Approver, request: EscalationRequest) -> bool:
+    answer = approve(request)
+    if inspect.isawaitable(answer):
+        answer = await answer
+    return answer is True  # only an explicit yes approves
+
+
+async def _decide(interrupt_value: Any, approve: Approver) -> dict:
+    """One HITL resume value: a decision per action request, in order."""
+    actions = interrupt_value.get("action_requests", []) if isinstance(interrupt_value, dict) else []
+    decisions = []
+    for action in actions:
+        if await _ask(approve, _to_request(action)):
+            decisions.append({"type": "approve"})
+        else:
+            decisions.append({"type": "reject", "message": DECLINED_MESSAGE})
+    return {"decisions": decisions}
+
+
+async def invoke_with_approval(agent, ticket_id: str, approve: Approver) -> Any:
+    """Invoke the agent once, resuming every escalation pause with the approver's answer."""
+    config = {"configurable": {"thread_id": f"{ticket_id}-{uuid.uuid4().hex}"}}
+    result = await agent.ainvoke(
+        {"messages": [{"role": "user", "content": f"Triage ticket {ticket_id}."}]}, config
+    )
+    while isinstance(result, dict) and result.get("__interrupt__"):
+        # HumanInTheLoopMiddleware raises one interrupt holding every pending action request.
+        resume = await _decide(result["__interrupt__"][0].value, approve)
+        result = await agent.ainvoke(Command(resume=resume), config)
+    return result
+
+
+def escalation_outcome(messages: Sequence[Any]) -> tuple[bool, bool]:
+    """(requested, escalated): whether an escalate_to_human call reached the approver, and whether it ran."""
+    requested = escalated = False
+    for message in messages:
+        if not isinstance(message, ToolMessage) or message.name != ESCALATION_TOOL:
+            continue
+        if message.status != "error":
+            requested = escalated = True
+        elif DECLINED_MESSAGE in str(message.content):
+            requested = True
+    return requested, escalated
+
+
+def check_escalation_decision(decision: dict, messages: Sequence[Any], ticket_id: str) -> str | None:
+    """Why a decision breaks the escalation rule, or None."""
+    requested, escalated = escalation_outcome(messages)
+    if decision["priority"] == "P1" and customer_plan(messages, ticket_id) == ENTERPRISE and not requested:
+        return (
+            f"Decision for ticket {ticket_id} is P1 for an Enterprise customer but escalate_to_human "
+            f"was not called."
+        )
+    if escalated and decision["priority"] != "P1":
+        return f"Ticket {ticket_id} was escalated but the final priority is {decision['priority']}, not P1."
+    return None
+
+
+async def run_with_retry(agent, ticket_id: str, approve: Approver | None = None) -> dict:
+    """Invoke the agent; on a schema, grounding or escalation failure, invoke it once more."""
+    approve = approve or terminal_approver
     failure = ""
     for _ in range(MAX_ATTEMPTS):
         try:
-            result = await agent.ainvoke(
-                {"messages": [{"role": "user", "content": f"Triage ticket {ticket_id}."}]}
-            )
+            result = await invoke_with_approval(agent, ticket_id, approve)
             decision = result.get("structured_response") if isinstance(result, dict) else None
             if decision is None:
                 raise TriageValidationError("the agent returned no structured decision")
@@ -228,6 +447,10 @@ async def run_with_retry(agent, ticket_id: str) -> dict:
                 f"and then get_customer_history with the customer_id it returned."
             )
             continue
+        escalation_failure = check_escalation_decision(decision, result.get("messages", []), ticket_id)
+        if escalation_failure:
+            failure = escalation_failure
+            continue
         return decision
     raise TriageAgentError(failure)
 
@@ -236,9 +459,12 @@ def _one_line(error: Exception) -> str:
     return " ".join(str(error).split()) or type(error).__name__
 
 
-async def triage(ticket_id: str) -> dict:
-    """Triage one ticket and return the decision as a plain dict."""
+async def triage(ticket_id: str, approve: Approver | None = None) -> dict:
+    """Triage one ticket and return the decision as a plain dict.
+
+    `approve(request)` answers each escalation and may be sync or async (returning an awaitable).
+    Only a literal `True` approves; any other answer declines. The default asks on the terminal."""
     model = build_model()  # fails on a missing key before anything else starts
     tools = await load_mcp_tools()
-    agent = build_agent(model, tools)
-    return await run_with_retry(agent, ticket_id)
+    agent = build_escalating_agent(model, tools)
+    return await run_with_retry(agent, ticket_id, approve)

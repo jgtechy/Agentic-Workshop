@@ -1,4 +1,4 @@
-"""Tests for the triage agent (Epic 2, story 2.1). Offline: no network, no API keys."""
+"""Tests for the triage agent (Epic 2, stories 2.1 and 2.2). Offline: no network, no API keys, no terminal."""
 
 import asyncio
 import json
@@ -152,7 +152,7 @@ class StubAgent:
         self.responses = list(responses)
         self.calls = 0
 
-    async def ainvoke(self, _inputs):
+    async def ainvoke(self, _inputs, _config=None):
         self.calls += 1
         response = self.responses.pop(0)
         if isinstance(response, Exception):
@@ -403,3 +403,403 @@ def test_extra_tools_and_middleware_are_accepted():
     result = run(graph.ainvoke({"messages": [{"role": "user", "content": "Triage ticket T-1042."}]}))
     assert fired == ["before_model"]
     assert result["structured_response"] == TriageDecision(**GOOD)
+
+
+# --- Human-gated escalation (story 2.2) --------------------------------------------------------
+
+P1_BUG = {"category": "bug", "priority": "P1", "route": "bug-team", "rationale": "Nothing saves, so P1 applies."}
+REASON = "P1 outage for an Enterprise customer."
+
+
+class Approver:
+    """A stub approver that records every request and gives a fixed answer."""
+
+    def __init__(self, answer: bool):
+        self.answer = answer
+        self.requests: list[agent.EscalationRequest] = []
+
+    def __call__(self, request):
+        self.requests.append(request)
+        return self.answer
+
+
+def never_asked(_request):
+    raise AssertionError("the approver must not be asked")
+
+
+def escalating_run(mcp_server, ticket_id, customer_id, *script, approve=None):
+    """Run triage-like: build_escalating_agent on MCP tools and a scripted model, then run_with_retry."""
+    model = scripted(*script)
+
+    async def go():
+        graph = agent.build_escalating_agent(model, await agent.load_mcp_tools(mcp_server))
+        return await run_with_retry(graph, ticket_id, approve)
+
+    return run(go())
+
+
+def lookups(ticket_id, customer_id, prefix):
+    return [
+        AIMessage("", tool_calls=[call("get_ticket", {"ticket_id": ticket_id}, f"{prefix}t")]),
+        AIMessage("", tool_calls=[call("get_customer_history", {"customer_id": customer_id}, f"{prefix}h")]),
+    ]
+
+
+def escalate(ticket_id, prefix):
+    return AIMessage("", tool_calls=[call("escalate_to_human", {"ticket_id": ticket_id, "reason": REASON}, f"{prefix}e")])
+
+
+def decide(decision, prefix):
+    return AIMessage("", tool_calls=[call("TriageDecision", decision, f"{prefix}d")])
+
+
+def spy_escalations(monkeypatch):
+    """Record every real run of the escalate_to_human tool body."""
+    ran = []
+    original = agent.escalate_to_human.func
+
+    def spy(ticket_id, reason):
+        ran.append(ticket_id)
+        return original(ticket_id, reason)
+
+    monkeypatch.setattr(agent.escalate_to_human, "func", spy)
+    return ran
+
+
+def test_approve_runs_the_tool(mcp_server, monkeypatch):
+    ran = spy_escalations(monkeypatch)
+    approver = Approver(True)
+    decision = escalating_run(
+        mcp_server, "T-1048", "C-05",
+        *lookups("T-1048", "C-05", "a"), escalate("T-1048", "a"), decide(P1_BUG, "a"),
+        approve=approver,
+    )
+    assert decision == P1_BUG
+    assert approver.requests == [agent.EscalationRequest("T-1048", REASON)]
+    assert ran == ["T-1048"]
+
+
+def test_decline_does_not_run_the_tool(mcp_server, monkeypatch):
+    ran = spy_escalations(monkeypatch)
+    approver = Approver(False)
+    decision = escalating_run(
+        mcp_server, "T-1048", "C-05",
+        *lookups("T-1048", "C-05", "a"), escalate("T-1048", "a"), decide(P1_BUG, "a"),
+        approve=approver,
+    )
+    assert decision == P1_BUG
+    assert len(approver.requests) == 1
+    assert ran == []
+
+
+def test_decline_tells_the_model_it_was_not_escalated(mcp_server):
+    model = scripted(*lookups("T-1048", "C-05", "a"), escalate("T-1048", "a"), decide(P1_BUG, "a"))
+
+    async def go():
+        graph = agent.build_escalating_agent(model, await agent.load_mcp_tools(mcp_server))
+        return await agent.invoke_with_approval(graph, "T-1048", Approver(False))
+
+    result = run(go())
+    escalation = [m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "escalate_to_human"]
+    assert len(escalation) == 1 and escalation[0].status == "error"
+    assert agent.DECLINED_MESSAGE in escalation[0].content
+    assert agent.escalation_outcome(result["messages"]) == (True, False)
+
+
+def test_no_trigger_no_prompt(mcp_server, monkeypatch):
+    ran = spy_escalations(monkeypatch)
+    decision = escalating_run(
+        mcp_server, "T-1042", "C-77",
+        *lookups("T-1042", "C-77", "a"), decide(GOOD, "a"),
+        approve=never_asked,
+    )
+    assert decision == GOOD and ran == []
+
+
+def test_not_enterprise_is_refused_before_any_prompt(mcp_server, monkeypatch):
+    ran = spy_escalations(monkeypatch)
+    # T-1043 belongs to C-12 (Acme, Team plan)
+    p1 = {"category": "bug", "priority": "P1", "route": "bug-team", "rationale": "Export is broken, so P1 applies."}
+    model = scripted(*lookups("T-1043", "C-12", "a"), escalate("T-1043", "a"), decide(p1, "a"))
+
+    async def go():
+        graph = agent.build_escalating_agent(model, await agent.load_mcp_tools(mcp_server))
+        return await agent.invoke_with_approval(graph, "T-1043", never_asked)
+
+    result = run(go())
+    refused = [m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "escalate_to_human"]
+    assert len(refused) == 1 and refused[0].status == "error" and "Enterprise" in refused[0].content
+    assert ran == []
+    assert result["structured_response"].priority == "P1"
+
+
+def test_escalation_before_customer_lookup_is_refused(mcp_server, monkeypatch):
+    ran = spy_escalations(monkeypatch)
+    model = scripted(
+        AIMessage("", tool_calls=[call("get_ticket", {"ticket_id": "T-1048"}, "t")]),
+        escalate("T-1048", "x"),
+        AIMessage("", tool_calls=[call("get_customer_history", {"customer_id": "C-05"}, "h")]),
+        escalate("T-1048", "y"),
+        decide(P1_BUG, "d"),
+    )
+    approver = Approver(True)
+
+    async def go():
+        graph = agent.build_escalating_agent(model, await agent.load_mcp_tools(mcp_server))
+        return await run_with_retry(graph, "T-1048", approver)
+
+    assert run(go()) == P1_BUG
+    assert len(approver.requests) == 1 and ran == ["T-1048"]
+
+
+def test_skipped_escalation_is_retried_once(mcp_server):
+    approver = Approver(True)
+    decision = escalating_run(
+        mcp_server, "T-1048", "C-05",
+        *lookups("T-1048", "C-05", "a"), decide(P1_BUG, "a"),  # attempt 1: skips the escalation
+        *lookups("T-1048", "C-05", "b"), escalate("T-1048", "b"), decide(P1_BUG, "b"),
+        approve=approver,
+    )
+    assert decision == P1_BUG and len(approver.requests) == 1
+
+
+def test_skipped_escalation_twice_stops_with_a_clear_error(mcp_server):
+    with pytest.raises(TriageAgentError, match="P1 for an Enterprise customer but escalate_to_human was not called") as info:
+        escalating_run(
+            mcp_server, "T-1048", "C-05",
+            *lookups("T-1048", "C-05", "a"), decide(P1_BUG, "a"),
+            *lookups("T-1048", "C-05", "b"), decide(P1_BUG, "b"),
+            approve=never_asked,
+        )
+    assert "\n" not in str(info.value)
+
+
+def test_approved_escalation_with_a_non_p1_decision_fails(mcp_server):
+    p2 = {**P1_BUG, "priority": "P2"}
+    with pytest.raises(TriageAgentError, match="escalated but the final priority is P2"):
+        escalating_run(
+            mcp_server, "T-1048", "C-05",
+            *lookups("T-1048", "C-05", "a"), escalate("T-1048", "a"), decide(p2, "a"),
+            *lookups("T-1048", "C-05", "b"), escalate("T-1048", "b"), decide(p2, "b"),
+            approve=Approver(True),
+        )
+
+
+def test_declined_escalation_with_a_non_p1_decision_is_accepted(mcp_server):
+    p2 = {**P1_BUG, "priority": "P2"}
+    decision = escalating_run(
+        mcp_server, "T-1048", "C-05",
+        *lookups("T-1048", "C-05", "a"), escalate("T-1048", "a"), decide(p2, "a"),
+        approve=Approver(False),
+    )
+    assert decision == p2
+
+
+def test_unattended_approver_never_reads_the_terminal(mcp_server, monkeypatch):
+    def no_terminal(*_args):
+        raise AssertionError("terminal read")
+
+    monkeypatch.setattr("builtins.input", no_terminal)
+    ran = spy_escalations(monkeypatch)
+    decision = escalating_run(
+        mcp_server, "T-1048", "C-05",
+        *lookups("T-1048", "C-05", "a"), escalate("T-1048", "a"), decide(P1_BUG, "a"),
+        approve=lambda _request: True,
+    )
+    assert decision == P1_BUG and ran == ["T-1048"]
+
+
+def test_async_approver_is_awaited(mcp_server, monkeypatch):
+    ran = spy_escalations(monkeypatch)
+
+    async def approve(_request):
+        return True
+
+    escalating_run(
+        mcp_server, "T-1048", "C-05",
+        *lookups("T-1048", "C-05", "a"), escalate("T-1048", "a"), decide(P1_BUG, "a"),
+        approve=approve,
+    )
+    assert ran == ["T-1048"]
+
+
+@pytest.mark.parametrize("answer", ["yes", 1, None, "y"])
+def test_only_an_explicit_true_counts_as_yes(mcp_server, monkeypatch, answer):
+    ran = spy_escalations(monkeypatch)
+    escalating_run(
+        mcp_server, "T-1048", "C-05",
+        *lookups("T-1048", "C-05", "a"), escalate("T-1048", "a"), decide(P1_BUG, "a"),
+        approve=lambda _request: answer,
+    )
+    assert ran == []
+
+
+def test_default_approver_is_the_terminal(mcp_server, monkeypatch, capsys):
+    answers = iter(["y"])
+    monkeypatch.setattr(agent, "_stdin_is_terminal", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *_: next(answers))
+    ran = spy_escalations(monkeypatch)
+    escalating_run(
+        mcp_server, "T-1048", "C-05",
+        *lookups("T-1048", "C-05", "a"), escalate("T-1048", "a"), decide(P1_BUG, "a"),
+    )
+    assert ran == ["T-1048"]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Escalated T-1048 to a person." in captured.err
+
+
+def test_triage_passes_the_approver_through(mcp_server, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    model = scripted(*lookups("T-1048", "C-05", "a"), escalate("T-1048", "a"), decide(P1_BUG, "a"))
+    monkeypatch.setattr(agent, "build_model", lambda: model)
+    real_load = agent.load_mcp_tools
+    monkeypatch.setattr(agent, "load_mcp_tools", lambda: real_load(mcp_server))
+    approver = Approver(True)
+    assert run(triage("T-1048", approve=approver)) == P1_BUG
+    assert len(approver.requests) == 1
+
+
+# --- The terminal approver ---------------------------------------------------------------------
+
+
+def ask_terminal(monkeypatch, capsys, *answers):
+    """terminal_approver on an interactive terminal whose person types `answers` (fake input echoes no newline)."""
+    monkeypatch.setattr(agent, "_stdin_is_terminal", lambda: True)
+    replies = iter(answers)
+
+    def fake_input(*_args):
+        reply = next(replies)
+        if reply is EOFError:
+            raise EOFError
+        return reply
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    approved = agent.terminal_approver(agent.EscalationRequest("T-1048", "Outage.\x1b[2J"))
+    return approved, capsys.readouterr()
+
+
+@pytest.mark.parametrize("answer", ["y", "yes", " YES ", "Y"])
+def test_terminal_yes(monkeypatch, capsys, answer):
+    approved, out = ask_terminal(monkeypatch, capsys, answer)
+    assert approved is True
+    assert out.out == ""
+    assert out.err.rstrip().endswith("Escalated T-1048 to a person.")
+
+
+@pytest.mark.parametrize("answer", ["n", "no", "NO"])
+def test_terminal_no(monkeypatch, capsys, answer):
+    approved, out = ask_terminal(monkeypatch, capsys, answer)
+    assert approved is False
+    assert out.out == ""
+    assert out.err.rstrip().endswith("Not escalated.")
+
+
+def test_terminal_asks_again_on_other_answers(monkeypatch, capsys):
+    approved, out = ask_terminal(monkeypatch, capsys, "", "maybe", "yep", "yes")
+    assert approved is True
+    assert out.err.count("[y/n]") == 4
+
+
+def test_terminal_end_of_input_declines(monkeypatch, capsys):
+    approved, out = ask_terminal(monkeypatch, capsys, "maybe", EOFError)
+    assert approved is False
+    assert out.err.rstrip().endswith("Not escalated.")
+
+
+def test_terminal_prompt_shows_ticket_and_reason_without_control_characters(monkeypatch, capsys):
+    _, out = ask_terminal(monkeypatch, capsys, "n")
+    assert "T-1048" in out.err and "Agent's reason" in out.err and "Outage." in out.err
+    assert "\x1b" not in out.err
+
+
+# --- Escalation guard and checks, unit level -------------------------------------------------
+
+
+def history_for(customer_id, plan, call_id="h1"):
+    body = {"customer_id": customer_id, "name": "X", "plan": plan, "open_tickets": 0, "ticket_ids": []}
+    return ToolMessage(content=json.dumps(body), name="get_customer_history", tool_call_id=call_id)
+
+
+def escalate_call(ticket_id="T-1042"):
+    return {"name": "escalate_to_human", "args": {"ticket_id": ticket_id, "reason": "r"}, "id": "e1"}
+
+
+def test_escalation_guard_accepts_enterprise():
+    assert check_tool_order(escalate_call(), [ticket_result("C-77"), history_for("C-77", "Enterprise")]) is None
+
+
+@pytest.mark.parametrize(
+    ("messages", "fragment"),
+    [
+        ([], "get_ticket"),
+        ([ticket_result("C-77")], "get_customer_history"),
+        ([ticket_result("C-77"), history_for("C-77", "Team")], "Enterprise"),
+        ([ticket_result("C-77"), history_for("C-31", "Enterprise")], "get_customer_history"),
+    ],
+)
+def test_escalation_guard_refuses(messages, fragment):
+    reason = check_tool_order(escalate_call(), messages)
+    assert reason and fragment in reason
+
+
+def test_escalation_guard_refuses_another_ticket():
+    reason = check_tool_order(escalate_call("T-2000"), [ticket_result("C-77"), history_for("C-77", "Enterprise")])
+    assert reason and "T-2000" in reason
+
+
+def escalation_message(status="success", content="Escalated T-1042 to a person."):
+    return ToolMessage(content=content, name="escalate_to_human", tool_call_id="e1", status=status)
+
+
+def test_stub_agent_p1_enterprise_with_escalation_is_accepted():
+    decision = {**GOOD, "priority": "P1"}
+    messages = [ticket_result("C-77"), history_result("C-77"), escalation_message()]
+    stub = StubAgent({"structured_response": TriageDecision(**decision), "messages": messages})
+    assert run(run_with_retry(stub, "T-1042", never_asked)) == decision
+
+
+def test_refused_escalation_does_not_count_as_requested():
+    messages = [escalation_message("error", "Refused: only tickets from Enterprise customers are escalated")]
+    assert agent.escalation_outcome(messages) == (False, False)
+
+
+def test_terminal_non_tty_stdin_declines_without_reading(monkeypatch, capsys):
+    monkeypatch.setattr(agent, "_stdin_is_terminal", lambda: False)
+
+    def no_read(*_args):
+        raise AssertionError("input() called on a non-interactive stdin")
+
+    monkeypatch.setattr("builtins.input", no_read)
+    approved = agent.terminal_approver(agent.EscalationRequest("T-1048", "Outage."))
+    out = capsys.readouterr()
+    assert approved is False
+    assert out.out == ""
+    assert "T-1048" in out.err and "Agent's reason" in out.err
+    assert out.err.strip().splitlines()[-1] == "Not escalated."
+
+
+# --- P1 for a non-Enterprise customer goes through the retry loop -------------------------------
+
+T1043_P1 = {"category": "bug", "priority": "P1", "route": "bug-team", "rationale": "Export is broken, so P1 applies."}
+
+
+def test_non_enterprise_p1_with_refused_escalation_is_accepted_first_time(mcp_server, monkeypatch):
+    ran = spy_escalations(monkeypatch)
+    # T-1043 belongs to C-12 (Acme, Team plan); the model tries to escalate and is refused.
+    decision = escalating_run(
+        mcp_server, "T-1043", "C-12",
+        *lookups("T-1043", "C-12", "a"), escalate("T-1043", "a"), decide(T1043_P1, "a"),
+        approve=never_asked,
+    )
+    assert decision == T1043_P1 and ran == []
+
+
+def test_non_enterprise_p1_without_escalation_is_accepted_first_time(mcp_server):
+    # Only one attempt is scripted: a retry would exhaust the fake model and fail.
+    decision = escalating_run(
+        mcp_server, "T-1043", "C-12",
+        *lookups("T-1043", "C-12", "a"), decide(T1043_P1, "a"),
+        approve=never_asked,
+    )
+    assert decision == T1043_P1
